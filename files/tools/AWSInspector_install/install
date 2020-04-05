@@ -1,0 +1,932 @@
+#!/bin/bash
+
+#By installing the Amazon Inspector Agent, you agree that your use is 
+# subject to the terms of your existing AWS Customer Agreement or other 
+# agreement with Amazon Web Services, Inc. or its affiliates governing your 
+# use of AWS services. You may not install and use the 
+# Amazon Inspector Agent unless you have an account in good standing with AWS.
+
+# Copyright 2016 Amazon Web Services, Inc. or its affiliates. All Rights Reserved.
+# Licensed under the terms of your existing AWS Customer Agreement 
+# <https://aws.amazon.com/agreement/> or other agreement with Amazon Web Services, Inc. 
+# or its affiliates governing your use of AWS services.
+#
+# Inspector Agent installer script to get the proper package installed.
+# Version: 1.1.1193.0
+
+# For debugging, uncomment this line:
+
+#set -eux
+
+###GET_INSTALL_FUNCTIONS###
+#!/bin/bash
+
+#functions
+function in_array() { 
+    local haystack=${1}[@]
+    local needle=${2}
+    for i in ${!haystack}; do
+        if [[ ${i} == ${needle} ]]; then 
+            return 0
+        fi
+    done
+    return 1
+}
+
+function exit_run_once {
+    local pidfile=${1}
+    local exitcode=${2}
+
+    rm -f $pidfile
+    exit $exitcode
+}
+  
+function init_run_once {
+    local pidfile=${1}
+    local pid_creation_code=1
+    if [[ -f $pidfile ]]; then
+        local pid=$(cat $pidfile)
+        ps -p $pid > /dev/null 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo "AWS Agent is already installing or updating with pid ${pid}. Exiting..."
+            exit 0
+        else # assume stale pidfile
+            echo $$ > $pidfile
+            pid_creation_code=$?
+        fi
+    else # There a theoretical race condition right here, but our cron does not spawn twice within a fractional second or even a minute, ever.
+        echo $$ > $pidfile
+        pid_creation_code=$?
+    fi
+
+    if [[ $pid_creation_code -ne 0 ]]; then
+        echo "Could not create PID file: $pidfile."
+        exit 1
+    fi
+}
+
+#This function expects at least 2 arguments:
+#  $1 - must be 'report_only' or 'report_and_exit', 
+#      if this argument equals to 'report_only' then this function will only report status
+#      if this argument equals to 'report_and_exit' then it will it report status and exit
+#      otherwise scrip will exit with error code 129
+#  $2 - status code
+#  $3 - (optional) args
+function report_status_and_exit_if_requested() {
+
+    local action="nil"
+    
+    if [[ $# -le 1 ]]; then
+        echo "no arguments has been passed... When expected at least two"
+        exit 129
+    fi
+    
+    if [[ $1 != "report_only" && $1 != "report_and_exit" ]]; then
+       echo "invalid first argument (action): '${1}', when expecting 'report_only' or 'report_and_exit'"
+       exit 129
+    fi
+
+    action=$1
+    
+    local result_param="nil"
+    local result="nil"
+
+    if [[ $# > 2 ]]; then
+        result_param=$3
+    fi
+    result=$2
+
+    #if inventory url is defined then start publishing
+    if [[ ! -z ${AGENT_METRICS_URL} ]]; then
+        ${DOWNLOAD_CMD} ${HEADER_ARG} "${AGENT_METRICS_URL}&x-op=${OP}&x-result=${result}&x-result-param=${result_param}"
+    else
+        echo "AWS Agent Inventory URL is not yet defined."
+    fi
+    
+    if [[ "${action}" = "report_and_exit" ]]; then
+        echo "Script exited with status code ${result} ${result_param}"
+        if [[ "${result}" = "SUCCESS" ]]; then 
+            exit 0
+        else 
+            exit 1
+        fi
+    fi
+    echo "Script reports status code ${result} ${result_param}"
+}
+
+function report_status() {
+    report_status_and_exit_if_requested "report_only" "$@"
+}
+
+function handle_status() {
+    report_status_and_exit_if_requested "report_and_exit" "$@"
+}
+
+function download_and_verify_sig() {
+
+    local download_url=$1
+    local download_file_name=$2
+    local is_it_km=$3
+
+    if [[ -z "${PUBKEY_FILE}" || -z "${SECURE_TMP_DIR}" || ! -d "${SECURE_TMP_DIR}" ]]; then
+        handle_status "SANITY_CHECK_FAILURE" "SECURE_TMP_DIR"
+    fi
+
+    echo "PUBKEY_FILE: ${SECURE_TMP_DIR}/${PUBKEY_FILE}"
+    if [[ -z "${SECURE_TMP_DIR}/${PUBKEY_FILE}" || ! -s "${SECURE_TMP_DIR}/${PUBKEY_FILE}" ]]; then
+        handle_status "SANITY_CHECK_FAILURE" "PUBKEY_FILE"
+    fi
+
+    #get the awsagent inventory file
+    ${DOWNLOAD_CMD} ${O_ARG} "${SECURE_TMP_DIR}/${download_file_name}" "${download_url}"
+    if [[ $? -ne 0 ]]; then
+        if [[ "${is_it_km}" == "true" ]]; then
+            return
+        fi 
+        echo "Failed to download the ${download_file_name} from ${download_url}"
+        if [[ "${is_it_km}" == "true" ]]; then
+           report_status "FILE_DOWNLOAD_ERROR" "${download_file_name}"
+           return
+        else
+           handle_status "FILE_DOWNLOAD_ERROR" "${download_file_name}" 
+        fi
+    fi
+
+    #get the awsagent inventory signature
+    ${DOWNLOAD_CMD} ${O_ARG} "${SECURE_TMP_DIR}/${download_file_name}.sig" "${download_url}.sig"
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to download the ${download_file_name} signature from ${download_url}.sig"
+        handle_status "FILE_DOWNLOAD_ERROR" "${download_file_name}.sig"
+    fi
+
+    gpg_results=$( gpg -q --no-default-keyring --keyring "${SECURE_TMP_DIR}/${PUBKEY_FILE}" --verify "${SECURE_TMP_DIR}/${download_file_name}.sig" "${SECURE_TMP_DIR}/${download_file_name}" 2>&1 )
+    if [[ $? -eq 0 ]]; then
+        echo "Validated ${download_file_name} signature with: $(echo "${gpg_results}" | grep -i fingerprint)"
+    else
+        echo "Error validating signature of ${download_file_name}, terminating.  Please contact AWS Support."
+        echo ${gpg_results}
+        handle_status "SIGNATURE_MISMATCH" "${download_file_name}"
+    fi
+}
+
+function get_signature_timestamp() {
+    local download_file_name=$1
+
+    SIGNATURE_TIMESTAMP="$(gpg --list-packets "${SECURE_TMP_DIR}/${download_file_name}.sig" 2>/dev/null | egrep 'version .* created' | head -n 1 | sed -e 's/.* created \([0-9]\{10\}\), .*/\1/')"
+}
+
+function verify_signature_timestamp() {
+    local previous_timestamp=$1
+    local signature_timestamp=$2
+
+    # SANITY CHECKS
+    # date --date='@1470000000' ==> Sun Jul 31 21:20:00 UTC 2016
+    # date --date='@2000000000' ==> Wed May 18 03:33:20 UTC 2033
+    if [[ -z "${previous_timestamp}" || -z "${signature_timestamp}" ]]; then
+        echo "Missing timestamp."
+        return 2
+    fi
+    if [[ "${previous_timestamp}" -lt 1470000000 || "${previous_timestamp}" -gt 2000000000 ]]; then
+        echo "Invalid previous timestamp."
+        return 3
+    fi
+    if [[ "${signature_timestamp}" -lt 1470000000 || "${signature_timestamp}" -gt 2000000000 ]]; then
+        echo "Invalid signature timestamp."
+        return 4
+    fi
+
+    # We have two valid timestamps -- the new one should excede the old
+    if [[ "${signature_timestamp}" -ge "${previous_timestamp}" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+function package_install() {
+    local package_path=$1 
+    local new_version=$2
+    local existing_version=$3
+    local package_type=$4
+    local rv=0
+
+    echo "package_install:package_path:     ${package_path}"
+    echo "package_install:new_version:      ${new_version}"
+    echo "package_install:existing_version: ${existing_version}"
+    echo "package_type                    : ${package_type}"
+    
+    if [[ -z ${package_path} || -z ${new_version} || -z ${existing_version} ]]; then
+        handle_status "SANITY_CHECK_FAILURE" "PACKAGE_INSTALLATION"
+    fi
+
+    local package_name=$(basename ${package_path})
+
+    #calculate version strings
+    local new_version_str=$(printf "%06d%06d%06d%06d" $(echo ${new_version} | sed 's/\./ /g'))
+    local existing_version_str=$(printf "%06d%06d%06d%06d" $(echo ${existing_version} | sed 's/\./ /g'))
+
+    if [[ "${package_name}" =~ \.deb$ ]] && which apt-get 2>/dev/null; then
+        echo "Installing with dpkg..."
+        apt-get update 
+        dpkg --force-overwrite -i "${package_path}"
+        apt-get --fix-broken -y install --no-remove
+        rv="$?"
+    elif [[ "${package_name}" =~ \.rpm$ ]] && which yum 2>/dev/null; then
+        echo "Installing with yum..."
+        if [[ ${new_version_str} == ${existing_version_str} ]]; then
+            echo "yum reinstall -y ${package_path}"
+            yum reinstall -y "${package_path}"
+        elif [[ ${new_version_str} > ${existing_version_str} ]]; then
+            echo "yum install -y ${package_path}"
+            yum install -y "${package_path}"
+        elif [[ ${new_version_str} < ${existing_version_str} ]]; then
+             echo "yum downgrade -y ${package_path}"
+             yum downgrade -y "${package_path}"
+        else
+             handle_status "SANITY_CHECK_FAILURE" "PACKAGE_VERSION_RPM"
+        fi
+        
+        rv="$?"
+    else
+        echo "No supported package managers are installed."
+        handle_status "MISSING_PACKAGE_MANAGER" "${DIST_TYPE}_${package_name}"
+    fi
+
+    if [[ ${rv} -ne 0 ]]; then
+        if [[ "${package_type}" == "agent" ]]; then
+            handle_status "PACKAGE_INSTALLATION_ERROR" "Agent__rv_${rv}__${package_name}__${new_version}__${existing_version}__${package_path}"
+        else
+            report_status "PACKAGE_INSTALLATION_ERROR" "KM__rv_${rv}__${package_name}__${new_version}__${existing_version}__${package_path}"
+        fi
+    fi
+}
+
+function verify_hash_package() {
+    local checked_package=$1
+    local expected_package_hash=$2
+
+    if [[ ! -s ${checked_package} || -z ${expected_package_hash} ]]; then
+        handle_status "SANITY_CHECK_FAILURE" "HASH_VERIFICATION_ERROR"
+    fi
+
+    # Check the hash of the package downloaded vs. the hash of the package in the index
+    local actual_package_hash=$( sha256sum ${checked_package} | cut -f1 -d' ')
+    if [[ "${actual_package_hash}" != "${expected_package_hash}" ]]; then
+        echo "Package sha256 hash does not match expected package hash from package inventory."
+        handle_status "HASH_MISMATCH" "${checked_package}"
+    else
+        echo "Validated agent package sha256 hash matches expected value."
+    fi
+}
+
+function download_and_install_kernel_module_package() {
+    local km_version_detail=$1
+    local new_km_version="${NEW_KM_VERSION}"
+    local existing_km_version="${EXISTING_KM_VERSION}"
+
+    if [[ -z "${new_km_version}" || -z "${km_version_detail}" || -z "${existing_km_version}" ]]; then
+        echo "New Kernel module Version: ${new_km_version} Existing Kernel module version: ${existing_km_version} & Kernel Version Detail: ${km_version_detail} is invalid"
+        handle_status "SANITY_CHECK_FAILURE" "INSTALL_KM_PACKAGE"
+    fi
+ 
+    local km_package_url=$( echo "${km_version_detail}" | cut -f5 -d'|' )
+    local km_package_hash=$(echo "${km_version_detail}" | cut -f4 -d'|' )
+    local km_package_name=$( echo "${km_version_detail}" | cut -f3 -d'|' )
+
+
+    if [[ -z "${km_package_url}" || -z "{km_package_name}" || -z "{km_package_hash}" ]]; then
+        echo "Kernel Package URL: ${km_package_url} , Kernel Package Hash: ${km_package_hash} & Kernel package name: ${km_package_name} is invalid."
+        handle_status "PARSE_ERROR" "KERNEL_MODULE_PACKAGE_${UNIQ_OS_ID}" 
+    fi
+
+    ${DOWNLOAD_CMD} ${O_ARG} "${SECURE_TMP_DIR}/${km_package_name}" "${km_package_url}"
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to download the kernel package from ${km_package_url}"
+        handle_status "FILE_DOWNLOAD_ERROR" "${km_package_name}"
+    fi
+
+
+    # Check the hash of the package downloaded vs. the hash of the package in the index
+    verify_hash_package "${SECURE_TMP_DIR}/${km_package_name}" "${km_package_hash}"
+    package_install "${SECURE_TMP_DIR}/${km_package_name}" "${new_km_version}" "${existing_km_version}" "km"
+
+}
+
+function download_and_install_agent_package() {
+    local agent_package_name=$1 
+    local agent_package_url=$2
+    local expected_agent_package_hash=$3
+    local new_agent_version="${NEW_AGENT_VERSION}"
+    local existing_agent_version="${EXISTING_AGENT_VERSION}"
+    
+    
+    if [[ -z "${new_agent_version}" || -z "${existing_agent_version}" || -z "${expected_agent_package_hash}" ]]; then
+        handle_status "SANITY_CHECK_FAILURE" "INSTALL_AGENT_PACKAGE"
+    fi
+
+    if [[ -z "${agent_package_url}" || -z "${agent_package_name}" || -z "${expected_agent_package_hash}" ]]; then
+        echo "Agent package URL: ${agent_package_url} or Agent Package Hash: ${expected_agent_package_hash} or Agent package name : ${agent_package_name} is invalid."
+        handle_status "PARSE_ERROR" "AGENT_INSTALL_PACKAGE_${UNIQ_OS_ID}"
+    fi
+ 
+    # Download the package for the proper version.
+    ${DOWNLOAD_CMD} ${O_ARG} ${SECURE_TMP_DIR}/${agent_package_name} ${agent_package_url}
+    if [[ ! -s ${SECURE_TMP_DIR}/${agent_package_name} ]]; then
+        echo "Failed to download package from the path ${agent_package_url}."  
+        handle_status "FILE_DOWNLOAD_ERROR" "${agent_package_name}"
+    fi
+
+    # Check the hash of the package downloaded vs. the hash of the package in the index
+    verify_hash_package "${SECURE_TMP_DIR}/${agent_package_name}" "${expected_agent_package_hash}"
+
+    package_install "${SECURE_TMP_DIR}/${agent_package_name}" "${new_agent_version}" "${existing_agent_version}" "agent"
+}
+
+function lowercase(){
+    echo "$1" | sed "y/ABCDEFGHIJKLMNOPQRSTUVWXYZ/abcdefghijklmnopqrstuvwxyz/"
+}
+
+function uppercase(){
+    echo "$1" | sed "y/abcdefghijklmnopqrstuvwxyz/ABCDEFGHIJKLMNOPQRSTUVWXYZ/"
+}
+
+
+function get_os_version() {
+    local os_dist_type=$1
+    local os_release_info=$2
+
+    if [[ -z "${os_dist_type}" || -z "${os_release_info}" ]]; then
+        handle_status "SANITY_CHECK_FAILURE" "GET_OS_VERSION"
+    fi
+
+    if [ "${os_dist_type}" = "CentOS" -o "${os_dist_type}" = "RedHat" -o "${os_dist_type}" = "amzn" ]; then
+        DIST=`echo "${os_release_info}" | sed s/\ release.*//`
+        REV=`echo "${os_release_info}" | sed s/.*release\ // | sed s/\ .*//`
+    elif [ "${os_dist_type}" = "SuSe" ] ; then
+        REV=`echo "${os_release_info}" | tr "\n" ' ' | sed s/.*=\ //`
+    elif [ "${os_dist_type}" = "Mandrake" ] ; then
+        REV=`echo "${os_release_info}" | sed s/.*release\ // | sed s/\ .*//`
+    elif [ "${os_dist_type}" = "debian" ] ; then
+        DIST=`echo "${os_release_info}" | grep '^DISTRIB_ID' | awk -F=  '{ print $2 }'`
+        REV=`echo "${os_release_info}" | grep '^DISTRIB_RELEASE' | awk -F=  '{ print $2 }'`
+    fi
+
+    echo "${DIST}.${REV}"
+}
+
+function get_os_info () {
+    OS=`lowercase \`uname\``
+    KERNEL=`uname -r`
+    MACH=`uname -m`
+    KERNEL_GROUP=$(echo $KERNEL | cut -f1-2 -d'.')
+
+    if [ "${OS}" = "linux" ] ; then
+      # Figure out which OS we are running on
+      local os_release_info=""
+
+      if [ -f /etc/centos-release ]; then
+          DIST_TYPE='CentOS'
+          os_release_info=`cat /etc/centos-release`
+      elif [ -f /etc/redhat-release ]; then
+          DIST_TYPE='RedHat'
+          os_release_info=`cat /etc/redhat-release`
+      elif [ -f /etc/system-release ]; then
+          if grep "Amazon Linux AMI" /etc/system-release; then
+            DIST_TYPE='amzn'
+          fi
+          os_release_info=`cat /etc/system-release`
+      elif [ -f /etc/SuSE-release ] ; then
+          DIST_TYPE='SuSe'
+          os_release_info=`cat /etc/SuSE-release`
+      elif [ -f /etc/mandrake-release ] ; then
+          DIST_TYPE='Mandrake'
+          os_release_info=`cat /etc/mandrake-release`
+      elif [ -f /etc/debian_version ] ; then
+          DIST_TYPE='debian'
+          os_release_info=`cat /etc/lsb-release`
+      fi
+
+      if [[ -z "${DIST_TYPE}" || -z "${os_release_info}" ]]; then
+          if [ -f /etc/os-release ]; then
+            source /etc/os-release
+            DIST_TYPE=$ID
+            DIST=$NAME
+            REV=$VERSION_ID
+          elif [ -f /usr/lib/os-release ]; then
+            source /usr/lib/os-release
+            DIST_TYPE=$ID
+            DIST=$NAME
+            REV=$VERSION_ID
+          fi
+      else
+          get_os_version "${DIST_TYPE}" "${os_release_info}"
+          if [[ "${DIST_TYPE}" = "RedHat" || "${DIST_TYPE}" = "debian" ]]  && [[ -f /etc/os-release ]]; then
+            source /etc/os-release
+            DIST_TYPE=$ID
+          fi
+      fi
+
+      if [ -f /etc/UnitedLinux-release ] ; then
+          DIST="${DIST}[`cat /etc/UnitedLinux-release | tr "\n" ' ' | sed s/VERSION.*//`]"
+      fi
+    fi
+
+    if [ "${OS}" == "darwin" ]; then
+        OS=mac
+    fi
+
+    DIST_TYPE=`lowercase $DIST_TYPE`
+    UNIQ_OS_ID="${DIST_TYPE}-${KERNEL}-${MACH}"
+    UNIQ_PLATFORM_ID="${DIST_TYPE}-${KERNEL_GROUP}."
+    OS_FULL_REVISION=$(echo "${REV}" | cut -f1-2 -d'.')
+    OS_MAIN_REVISION=$(echo "${REV}" | cut -f1 -d'.')
+
+    echo "${DIST_TYPE}.${OS_FULL_REVISION}.${OS_MAIN_REVISION}"
+
+    if [[ -z "${DIST}" || -z "${DIST_TYPE}" ]]; then
+        echo "Unsupported distribution: ${DIST} and distribution type: ${DIST_TYPE}"
+        exit 1
+    fi
+}
+function callUname () {
+    local args=("$@")
+    echo "$(uname ${args})"
+}
+
+function uninstall_km() {
+    local kmods_dir=$1 
+    if [ "${DIST_TYPE}" = "ubuntu" ] || [ "${DIST_TYPE}" = "debian" ]; then
+        apt-get purge -qq -y "awsagentkernel*"
+    else 
+        yum remove -q -y 'AwsAgentKernel*'
+    fi
+    rm -rf ${kmods_dir}
+}
+
+function get_installed_km_version() {
+    if [ "${DIST_TYPE}" = "ubuntu" ] || [ "${DIST_TYPE}" = "debian" ]; then
+        EXISTING_KM_VERSION=$(dpkg-query -W -f='${VERSION}' "awsagentkernelmodule-${KERNEL_VERSION_WO_ARCH}" | cut -f1 -d'-')
+        rv=${PIPESTATUS[0]}
+    else
+        EXISTING_KM_VERSION=$(rpm -qa "AwsAgentKernelModule__${DIST_TYPE}__${KERNEL_VERSION_WO_ARCH}" --queryformat '%{VERSION}')
+        rv=$?
+    fi
+    
+    if [[ -z "${EXISTING_KM_VERSION}" ]]; then
+        echo "cannot find installed KM VERSION... assumed '0.0.0.0' "
+        EXISTING_KM_VERSION="0.0.0.0"
+    fi
+    
+    echo "get_installed_km_version: EXISTING_KM_VERSION:${EXISTING_KM_VERSION} exit status:${rv}"
+}
+
+function get_km_manifest_file_name() {
+    # DIST_TYPE and KERNEL_GROUP are not enough to identify a platform. Starting with Amazon Linux 2, REV becomes part of KM manifest file name.
+    REV_MAIN_VERSION=$(echo $REV | cut -f1 -d'.')
+    if [[ $DIST_TYPE_UPPERCASE == "AMZN" && ${REV_MAIN_VERSION} == "2" ]]; then
+        REV_IN_FILE_NAME=$REV_MAIN_VERSION
+    else
+        REV_IN_FILE_NAME=""
+    fi
+    KERNEL_MANIFEST_FILE_NAME="KM_MANIFEST_${DIST_TYPE_UPPERCASE}${REV_IN_FILE_NAME}_${KERNEL_GROUP}_${KERNEL_MANIFEST_VERSION_3DIGITS}.txt"
+}
+
+function executeEnvironmentCleanup() {
+    echo "Installation script completed successfully."
+}
+
+function getAgentStatus() {
+    local agent_status=$( ${AGENT_EXEC} status )
+    echo "Agent status completed with code:$?"
+    echo "${agent_status}"
+}
+
+function usage() {
+    executing_script=$(basename "${BASH_SOURCE[0]}")
+    echo "Usage sudo ${executing_script}< options > "
+    echo "Options:"
+    echo "-u [ true | false ] Automatically update Aws Agent when versions become available. Applicable only during first installation."
+}
+
+# customer may have somehow disabled agent.
+# an update shouldn't override that decision
+function check_awsagent_condition() {
+    if [[ $(basename "${BASH_SOURCE[0]}" ) = "update" ]]; then # otherwise this is a fresh install
+        if [[ ! -f /var/run/awsagent.pid ]]; then
+            echo "/var/run/awsagent.pid not found. Updater only runs when agent is expected to be running."
+            handle_status "SUCCESS" "AGENT_NOT_RUNNING_NO_UPDATE"
+        fi
+    fi
+}
+
+#
+#Search AgentManifest file or version file 
+# - Search agent manifest file by              ${DIST_TYPE}.${OS_FULL_REVISION}
+# - If not found then search agent manifest by ${DIST_TYPE}.${OS_MAIN_REVISION}
+# - If not found then search agent version by  ${UNIQ_PLATFORM_ID}
+#Load row_value and parsing out following global variables:
+#  - AGENT_PACKAGE_URL
+#  - EXPECTED_AGENT_PACKAGE_HASH
+#  - NEW_AGENT_VERSION
+function searchAgentManifest() {
+    #first check the full version...
+    local os_search_key="${DIST_TYPE}-${OS_FULL_REVISION} "
+    if [ $MACH == "aarch64" ]; then
+        os_search_key="${DIST_TYPE}-${OS_FULL_REVISION}-${MACH} "
+    fi
+    local path_to_agent_manifest=$1
+    local path_to_agent_version=$2
+    local row_value=$( grep -m 1 -i "${os_search_key}" "${path_to_agent_manifest}" )
+    AGENT_PACKAGE_URL=$( echo "${row_value}" | cut -f3 -d' ' )
+    EXPECTED_AGENT_PACKAGE_HASH=$( echo "${row_value}" | cut -f2 -d' ')
+    NEW_AGENT_VERSION=$( echo "${row_value}" | cut -f7 -d'/' )
+    if [[ -z "${row_value}" ]]; then
+        # there is no entry for full version... searching for MainVersion:
+        os_search_key="${DIST_TYPE}-${OS_MAIN_REVISION} "
+        if [ $MACH == "aarch64" ]; then
+            os_search_key="${DIST_TYPE}-${OS_MAIN_REVISION}-${MACH} "
+        fi
+        row_value=$( grep -m 1 -i "${os_search_key}" "${path_to_agent_manifest}" )
+        AGENT_PACKAGE_URL=$( echo "${row_value}" | cut -f3 -d' ' )
+        EXPECTED_AGENT_PACKAGE_HASH=$( echo "${row_value}" | cut -f2 -d' ' )
+        NEW_AGENT_VERSION=$( echo "${row_value}" | cut -f7 -d'/' )
+        if [[ -z "${row_value}" ]]; then
+            echo "using legacy VERSION file"
+            row_value=$( grep -m 1 -i "${UNIQ_PLATFORM_ID}" "${path_to_agent_version}" )            
+            AGENT_PACKAGE_URL=$( echo "${row_value}" | cut -f4 -d' ' )
+            EXPECTED_AGENT_PACKAGE_HASH=$( echo "${row_value}" | cut -f3 -d' ' )
+            NEW_AGENT_VERSION=$( echo "${row_value}" | cut -f7 -d'/' )
+            if [[ -z "${row_value}" ]]; then
+                echo "Failed to find an inspector agent package for this OS:${UNIQ_PLATFORM_ID}."
+                handle_status "MISSING_AGENT_PLATFORM" "$os_search_key"
+            fi
+        fi
+    fi
+}
+
+if [[ $(whoami) != "root" ]]; then
+    echo "Script is run as $(whoami). Please run as root"
+    exit 1
+fi
+
+PIDFILE="/var/run/awsagent_install_or_update.PID"
+init_run_once $PIDFILE
+
+#Create a Secure temp directory where we get all files and then use them.
+SECURE_TMP_DIR=$(mktemp -d /tmp/awsagent.XXXXXXXX)
+if [[ ! -d "$SECURE_TMP_DIR" ]]; then
+  echo "Script cannot create temporary directory"
+  exit 1
+fi
+
+# Perform Cleanup upon exit
+trap "EXIT_CODE=$?; rm -rf ${SECURE_TMP_DIR}; exit_run_once $PIDFILE $EXIT_CODE" EXIT
+
+#define constants
+declare -a SUPPORTED_REGIONS=("us-east-1" "us-west-1" "us-west-2" "ap-northeast-1" "eu-west-1" "ap-northeast-2" "ap-southeast-2" "ap-south-1" "eu-central-1" "eu-north-1" "us-east-2" "us-gov-west-1" "us-gov-east-1")
+ROOTDIRECTORY="$(cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
+AGENT_INVENTORY_FILE="AWS_AGENT_INVENTORY"
+AGENT_MANIFEST_FILE="AGENT_MANIFEST"
+AGENT_VERSION_FILE="VERSION"
+AGENT_CFG_KEY="agent.cfg" 
+PUBKEY_FILE="inspector.gpg"
+CRON_UPDATE_AGENT=true
+OP=install
+
+if hash curl 2>/dev/null
+then
+  DOWNLOAD_CMD="curl -s --fail --retry 5 --max-time 30 "
+  O_ARG=" -o "
+  CONSOLE_ARG=""
+  HEADER_ARG=" --head "
+else
+  DOWNLOAD_CMD="wget --quiet --tries=5 --timeout=30 "
+  O_ARG=" -O "
+  CONSOLE_ARG=" -qO- "
+  HEADER_ARG=" -S --spider "
+fi
+
+#define inspector constants
+AGENT_CONFIG_FILE=/opt/aws/awsagent/etc/agent.cfg
+AGENT_EXEC=/opt/aws/awsagent/bin/awsagent
+AGENT_KMOD=/opt/aws/awsagent/kmods/amznmon64.ko
+AGENT_KMOD_DIR=/opt/aws/awsagent/kmods
+AGENT_KMOD_NAME=amznmon64.ko
+AGENT_INIT_SCRIPT="/etc/init.d/awsagent"
+AGENT_ENV_CONFIG="/etc/init.d/awsagent.env"
+INSTALL_CONFIG_FILE=/opt/aws/awsagent/etc/install.cfg
+
+#Domain specific configuration
+INSTALLER_EXT=""
+BUCKET="aws-agent.us-west-2"
+
+#check if environment environment file exists and if so source it
+if [[ -f "${AGENT_ENV_CONFIG}" ]]; then
+  source "${AGENT_ENV_CONFIG}"
+fi
+
+
+#check if environment override file exists and if so source it
+if [[ -f "${ROOTDIRECTORY}/environmentOverride" ]]; then
+    source "${ROOTDIRECTORY}/environmentOverride"
+fi
+
+#handle installer options
+while getopts ":u:" opt; do
+    case $opt in
+        u)
+            echo "Forced update specified as argument is : $OPTARG"
+            if [[ $(basename "${BASH_SOURCE[0]}" ) = "install" ]]; then
+                CRON_UPDATE_AGENT=$OPTARG
+            fi
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG"
+            usage
+            exit 1
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." 
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+#call the os info function to get details
+get_os_info 
+
+check_awsagent_condition
+
+KERNEL_VERSION=`callUname -r`
+
+if [[ -z "${KERNEL_VERSION}" ]]; then
+    handle_status "NO_KERNEL_VERSION"
+fi
+
+KERNEL_GROUP=$(echo "${KERNEL_VERSION}" | cut -f 1-2 -d'.')
+KERNEL_VERSION_WO_ARCH=$(basename ${KERNEL_VERSION} .x86_64)
+
+echo "Distribution of the machine is ${DIST}." 
+echo "Distribution type of the machine is ${DIST_TYPE}."
+echo "Revision of the distro is ${REV}."
+echo "Kernel version of the machine is ${KERNEL_VERSION}."
+
+#gather all meta data information
+METADATA_AZ=$( ${DOWNLOAD_CMD} ${CONSOLE_ARG} http://169.254.169.254/latest/meta-data/placement/availability-zone)
+METADATA_INSTANCE_TYPE=$( ${DOWNLOAD_CMD} ${CONSOLE_ARG} http://169.254.169.254/latest/meta-data/instance-type)
+METADATA_REGION=$( echo $METADATA_AZ | sed -e 's/[a-z]*$//' )
+
+if [[ -n "${METADATA_REGION}" ]]; then
+    REGION=${METADATA_REGION}
+else
+    echo "No region information was obtained."
+    handle_status "NO_REGION_INFO"
+fi
+
+#check if the obtained region is supported by inspector
+if in_array SUPPORTED_REGIONS "${REGION}"; then
+    echo "$(hostname -f) is an EC2 instance reporting region as ${REGION}."
+else
+    echo "Aws Agent is only supported in ${SUPPORTED_REGIONS[@]}"
+    handle_status "UNSUPPORTED_REGION" ${REGION}
+fi
+
+#Base url formation
+if [[ -z "${INSTALLER_EXT}" ]]; then
+    BUCKET="aws-agent.${REGION}"
+fi
+
+BASE_URL="https://s3.dualstack.${REGION}.amazonaws.com/${BUCKET}"
+
+#check existing agent status to get the version information of the running agent
+if [ "${DIST_TYPE}" = "ubuntu" ] || [ "${DIST_TYPE}" = "debian" ]; then
+    EXISTING_AGENT_VERSION=$(dpkg-query -W -f='${VERSION}' "awsagent" | cut -f1 -d'-')
+    rv=${PIPESTATUS[0]}
+else
+    EXISTING_AGENT_VERSION=$(rpm -qa "AwsAgent" --queryformat '%{VERSION}')
+    rv=$?
+fi
+echo "Check for existing AwsAgent completed with error code:${rv}"
+if [[ -z "${EXISTING_AGENT_VERSION}" ]]; then   
+    EXISTING_AGENT_VERSION="0.0.0.0"
+fi
+   
+echo "Existing version of agent installed is ${EXISTING_AGENT_VERSION}."
+
+#get installed kernel module version based on kernel version in machine
+get_installed_km_version
+echo "Existing version of kernel module installed is ${EXISTING_KM_VERSION}."
+
+#Agent and Kernel Param
+AGENT_ID_PARAM="x-installer-version=1.1.1193.0&x-existing-version=${EXISTING_AGENT_VERSION}&x-uniq-os-id=${UNIQ_OS_ID}&x-instance-type=${METADATA_INSTANCE_TYPE}"
+KERNEL_ID_PARAM="x-existing-km-version=${EXISTING_KM_VERSION}"
+AGENT_INVENTORY_URL="${BASE_URL}/linux/latest/${AGENT_INVENTORY_FILE}"
+
+BASE_METRIC_URL="https://s3.dualstack.${REGION}.amazonaws.com/${BUCKET}"
+AGENT_INVENTORY_METRIC_URL="${BASE_METRIC_URL}/linux/latest/${AGENT_INVENTORY_FILE}"
+AGENT_METRICS_URL="${AGENT_INVENTORY_METRIC_URL}?${AGENT_ID_PARAM}&${KERNEL_ID_PARAM}"
+
+
+if [[  -n "${BASH_SOURCE[0]}"  &&  $(basename "${BASH_SOURCE[0]}" ) = "update"  ]]; then
+    OP=update
+    if [[ ! -f "${AGENT_EXEC}" ]]; then
+        echo "Attempting update, but binary does not exist. Please run 'install' instead."
+        handle_status "WRONG_EXEC_MODE" "update" 
+    fi
+
+    if [[ -s "${INSTALL_CONFIG_FILE}" ]]; then
+        echo "Detected running as updater script, loading saved configuration from ${INSTALL_CONFIG_FILE}..."
+        source ${INSTALL_CONFIG_FILE}
+    fi
+
+    COLLECT="$( getAgentStatus | grep -Ei "Collecting\s*:" | sed -re 's/Collecting\s*:\s*//i' )"
+
+    if [[ "${COLLECT}" = "true" ]]; then
+        echo "Agent is actively collecting at this time, cannot update agent while it is collecting data!"
+        handle_status "AGENT_RUNNING_ASSESSMENT"
+    elif [[ "${CRON_UPDATE_AGENT}" = "false" ]]; then
+        echo "Update is not permitted according to configuration parameter mentioned as argument."
+        handle_status "CRON_UPDATE_AGENT_DISABLED"
+    else
+        echo "Agent is inactive, continuing to update..."
+    fi
+fi
+     
+# Check that the dir exists and is owned by our euid (root)
+if [[ ! -O "${SECURE_TMP_DIR}" ]]; then
+    echo "Unable to create secure temporary directory ${SECURE_TMP_DIR}."
+    handle_status "TMP_DIR_ERROR"
+fi
+chmod 700 "${SECURE_TMP_DIR}"
+
+#get the public key
+${DOWNLOAD_CMD} ${O_ARG} "${SECURE_TMP_DIR}/${PUBKEY_FILE}" "${BASE_URL}/linux/latest/${PUBKEY_FILE}"
+if [[ $? != 0 ]]; then 
+    echo "Failed to download public key from the path ${BASE_URL}/linux/latest/${PUBKEY_FILE}" 
+    handle_status "FILE_DOWNLOAD_ERROR" "${PUBKEY_FILE}"
+fi
+
+#get the awsagent inventory file
+download_and_verify_sig "${AGENT_INVENTORY_URL}" "${AGENT_INVENTORY_FILE}"
+
+#send start agent census metric
+${DOWNLOAD_CMD} ${HEADER_ARG} "${AGENT_METRICS_URL}&x-op=${OP}&x-result=begin"
+
+AGENT_MANIFEST_URL="$(grep "${AGENT_MANIFEST_FILE}" "${SECURE_TMP_DIR}/${AGENT_INVENTORY_FILE}" | grep -v "${AGENT_MANIFEST_FILE}.sig" | cut -f2 -d' ')"
+AGENT_VERSION_URL="$(grep "${AGENT_VERSION_FILE}" "${SECURE_TMP_DIR}/${AGENT_INVENTORY_FILE}" | grep -v "${AGENT_VERSION_FILE}.sig" | cut -f2 -d' ')"
+if [[ -z "${AGENT_MANIFEST_URL}"  &&  -z "${AGENT_VERSION_URL}" ]]; then
+    echo "Agent manifest file URL was not obtained. Please contact AWS support."
+    handle_status "PARSE_ERROR" "${AGENT_MANIFEST_FILE} and ${AGENT_VERSION_FILE} are both empty"
+fi
+
+echo "AGENT_MANIFEST_URL: ${AGENT_MANIFEST_URL}"
+echo "AGENT_VERSION_URL:  ${AGENT_VERSION_URL}"
+
+download_and_verify_sig "${AGENT_MANIFEST_URL}" "${AGENT_MANIFEST_FILE}"
+download_and_verify_sig "${AGENT_VERSION_URL}"  "${AGENT_VERSION_FILE}"
+
+searchAgentManifest "${SECURE_TMP_DIR}/${AGENT_MANIFEST_FILE}" "${SECURE_TMP_DIR}/${AGENT_VERSION_FILE}"
+
+echo "AGENT_PACKAGE_URL: ${AGENT_PACKAGE_URL}"
+echo "EXPECTED_AGENT_PACKAGE_HASH: ${EXPECTED_AGENT_PACKAGE_HASH}"
+echo "NEW_AGENT_VERSION:${NEW_AGENT_VERSION}"
+
+if [[ -z "${NEW_AGENT_VERSION}" ]]; then
+    handle_status "SANITY_CHECK_FAILURE" "NEW_AGENT_VERSION"
+fi
+
+DIST_TYPE_UPPERCASE=`uppercase "${DIST_TYPE}"`
+
+#
+# Check if we need to install agent 
+#
+need_install_agent=true
+if [[ $(basename "${BASH_SOURCE[0]}" ) == "update" ]]; then
+   if [[ "${EXISTING_AGENT_VERSION}" == "${NEW_AGENT_VERSION}" ]]; then
+      need_install_agent=false
+   fi
+fi
+
+#
+# Check if we need to install kernel module
+#
+need_install_kernel="true"
+is_kernel_missing="false"
+
+KERNEL_MANIFEST_VERSION="$(grep "km_version" "${SECURE_TMP_DIR}/${AGENT_INVENTORY_FILE}" | cut -f2 -d' ')"
+
+
+if [[ -z "${KERNEL_MANIFEST_VERSION}" ]]; then    
+    echo "Warning: No supported kernel module is available in this installation package for ${UNIQ_OS_ID}"
+    echo "Inspector rules packages that require the kernel module cannot be used for assessments. "
+    echo "Agent installation will continue without support for kernel module."
+    need_install_kernel="false"
+    is_kernel_missing="true"
+    report_status "PARSE_ERROR" "KERNEL_MANIFEST_VERSION"
+else
+    KERNEL_MANIFEST_VERSION_3DIGITS=$(echo "${KERNEL_MANIFEST_VERSION}" | cut -f 1-3 -d".")
+    get_km_manifest_file_name
+    KERNEL_MANIFEST_URL="${BASE_URL}/kernel-modules/${KERNEL_MANIFEST_FILE_NAME}"
+    download_and_verify_sig "${KERNEL_MANIFEST_URL}" "${KERNEL_MANIFEST_FILE_NAME}" "true"
+
+    KERNEL_MODULE_VERSION_DETAIL=$( grep -i "${KERNEL_VERSION_WO_ARCH}" "${SECURE_TMP_DIR}/${KERNEL_MANIFEST_FILE_NAME}" | tail -n -1 )
+        
+    if [[ -z "${KERNEL_MODULE_VERSION_DETAIL}" ]]; then
+        echo "Warning: Kernel module failed to install or failed to find an inspector kernel module package for this OS: ${UNIQ_OS_ID}"
+        echo "Inspector rules packages that require the kernel module cannot be used for assessments. Agent installation will continue without support for kernel module"
+        need_install_kernel="false"
+        is_kernel_missing="true"
+        report_status "MISSING_KERNEL_VERSION" "${UNIQ_OS_ID}"  
+    fi
+
+    NEW_KM_VERSION=$( echo "${KERNEL_MODULE_VERSION_DETAIL}" | cut -f2 -d'|' )
+        
+    if [[ -z "${NEW_KM_VERSION}" ]]; then
+        need_install_kernel="false"
+        is_kernel_missing="true"
+        echo "Warning: No supported kernel module is available in this installation package for ${UNIQ_OS_ID}"
+        echo "Inspector rules packages that require the kernel module cannot be used for assessments. Agent installation will continue without support for kernel module."
+        report_status "MISSING_KERNEL_VERSION" "${UNIQ_OS_ID}"
+    fi
+    
+    #
+    # We will not install kernel version only if
+    # kernel avaiable to install and kernel version didn't changed and no need to install agent
+    # 
+    if [[ "${EXISTING_KM_VERSION}" == "${NEW_KM_VERSION}" && "${need_install_agent}" == "false" ]]; then
+        need_install_kernel="false"
+        is_kernel_missing="false"
+    fi    
+fi
+
+
+if [[ "${need_install_kernel}" == "true" ]]; then
+   download_and_install_kernel_module_package "${KERNEL_MODULE_VERSION_DETAIL}"
+fi
+
+AGENT_KMOD_KERNEL_SPECIFIC="${AGENT_KMOD_DIR}/${NEW_KM_VERSION}/${AGENT_KMOD_NAME}.${KERNEL_VERSION}"
+
+if [[ "${is_kernel_missing}" == "false" ]]; then
+    if [[ -f "${AGENT_KMOD_KERNEL_SPECIFIC}" ]]; then
+        cp -f "${AGENT_KMOD_KERNEL_SPECIFIC}" "${AGENT_KMOD}"
+    fi
+else
+
+    uninstall_km ${AGENT_KMOD_DIR}
+    
+    echo "Warning: No supported kernel module is available in this installation package for ${UNIQ_OS_ID}"
+    echo "Inspector rules packages that require the kernel module cannot be used for assessments. Agent installation will continue without support for kernel"
+    echo "Missing amazon kernel folder: '${AGENT_KMOD_KERNEL_SPECIFIC}'"      
+    report_status "MISSING_KM_FILE" "${NEW_KM_VERSION}__${UNIQ_OS_ID}" 
+    #report_status "MISSING_KM_FILE" "${NEW_KM_VERSION}__${UNIQ_OS_ID}"
+fi
+
+if [[ "${need_install_agent}" == "true" ]]; then
+    if [ "${DIST_TYPE}" = "ubuntu" ] || [ "${DIST_TYPE}" = "debian" ]; then
+        AGENT_PACKAGE_NAME="awsagent.deb"
+    else 
+        AGENT_PACKAGE_NAME="AWSAgent.rpm"
+    fi
+    
+    echo "AGENT_PACKAGE_NAME:${AGENT_PACKAGE_NAME}"
+    download_and_install_agent_package ${AGENT_PACKAGE_NAME} ${AGENT_PACKAGE_URL} ${EXPECTED_AGENT_PACKAGE_HASH}
+    
+    umask 077
+    # Save the config so we can update with the same parameters
+    [[ -f ${INSTALL_CONFIG_FILE} ]] && mv -f ${INSTALL_CONFIG_FILE} ${INSTALL_CONFIG_FILE}.old
+    echo "AGENT_CFG_KEY=${AGENT_CFG_KEY}" >> ${INSTALL_CONFIG_FILE}
+    echo "CRON_UPDATE_AGENT=${CRON_UPDATE_AGENT}" >> ${INSTALL_CONFIG_FILE} 
+fi
+
+if [[ ! -f ${AGENT_CONFIG_FILE} && -f ${AGENT_CONFIG_FILE}.orig ]]; then
+    cp ${AGENT_CONFIG_FILE}.orig ${AGENT_CONFIG_FILE}
+fi
+
+RUNNING_VERSION=$( getAgentStatus | grep -Ei "Agent\s*version" | sed -re 's/Agent\s*version\s*:\s*//i' )
+ARSENAL_ENDPOINT=$( getAgentStatus | grep -Ei "Endpoint" | sed -re 's/Endpoint\s*:\s*//i' )
+
+#send installer end metric 
+${DOWNLOAD_CMD} ${HEADER_ARG} "${AGENT_METRICS_URL}&x-op=${OP}&x-result=SUCCESS&x-running-agent-version=${RUNNING_VERSION}"
+
+executeEnvironmentCleanup
+
+echo
+echo "Notice:"
+echo "By installing the Amazon Inspector Agent, you agree that your use is subject to the terms of your existing "
+echo "AWS Customer Agreement or other agreement with Amazon Web Services, Inc. or its affiliates governing your "
+echo "use of AWS services. You may not install and use the Amazon Inspector Agent unless you have an account in "
+echo "good standing with AWS."
+echo "*  *  *"
+echo "Current running agent reports to arsenal endpoint: $ARSENAL_ENDPOINT"
+echo "Current running agent reports version as: $RUNNING_VERSION"
+echo "This install script was created to install agent version:1.1.1193.0"
+echo "In most cases, these version numbers should be the same."
+if [[ "${is_kernel_missing}" == "true" ]]; then
+    echo "Warning: No supported kernel module is available in this installation or kernel module failed to install"
+    echo "Inspector rules packages that require the kernel module cannot be used for assessments."
+fi
+echo 
+
+
+

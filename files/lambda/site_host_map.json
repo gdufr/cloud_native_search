@@ -1,0 +1,22 @@
+{
+    "README": {
+        "purpose": "This file provides a mapping of ids to search fields and search values.",
+        "structure": "Each entry in this file uses the id as the key.  This id is passed from the client when the user executes a search.  The value is an array of objects.  Each object contains the field in CloudSearch that should be searched (match_field) and the corresponding value. For example: the id_2 should return results from both the (exact match) host www.otherdomain.com and (partial match) urls otherRelatedDomain.com. Weather a search includes only exact or partial matches is an artifact of the data types in CloudSearch and is not configurable in this file. The host field is a literal (exact match only), the url field is a text (partial matching)"
+    },
+    "id_1": [
+        {
+            "match_field": "host",
+            "value": "www.domain.com"
+        }
+    ],
+    "id_2": [
+        {
+            "match_field": "host",
+            "value": "www.otherdomain.com"
+        }
+        ,{
+            "match_field": "url",
+            "value": "otherRelatedDomain.com"
+        }
+    ]
+}

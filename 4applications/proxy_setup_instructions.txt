@@ -1,0 +1,6 @@
+# set up a ssh proxy from port 8157 (or whichever port you need) into the cluster master hadoop console 
+ssh -N -L 8157:"${aws_emr_cluster.cluster.master_public_dns}":8088 hadoop@"${aws_emr_cluster.cluster.master_public_dns}"
+
+# connect in a local browser
+http://localhost:8157/cluster
+

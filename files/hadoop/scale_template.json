@@ -1,0 +1,9 @@
+{
+    "ClusterId": "${emr_cluster_id}", 
+    "InstanceGroups": [
+        {
+            "InstanceGroupId": "${emr_instance_group_id}", 
+            "InstanceCount": ${emr_node_count}
+        }
+    ]
+}

@@ -1,0 +1,27 @@
+Install aws cli 
+
+aws configure with desired account credentials 
+
+Install terraform 
+
+Pull repo
+ 
+Update common.vars.tf to include the new workspace variables: 
+
+in each of the numbered sequence directories ("1terraform-state-setup/terraform.config.tf ", "2cloudsearch_setup/terraform.config.tf "… ) update the bucket and dynamodb_table  in the terraform.config.tf file to the new values (to match whatever you set them to in the common.vars.tf): 
+
+    bucket               = "terraform-state-lock-env" 
+
+    dynamodb_table       = "terraform-state-lock-env" 
+
+ 
+
+terraform apply the sequence: 
+
+1terraform-state-setup - creates the s3 bucket and dynamodb table for remote state tracking 
+
+2cloudsearch_setup - creates the cloudsearch domain and index fields 
+
+3application_support_setup - create the VPC, API Gateway, Lambda functions, S3 objects, Security Groups, etc
+
+4applications - create and configure the EMR cluster with cron jobs to trigger daily crawl
